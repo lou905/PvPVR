@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Escape the Pit VR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<script src="https://cdn.jsdelivr.net/npm/aframe@1.7.1/dist/aframe-master.min.js"></script>
+<script>
+  // Backup: if the CDN is blocked, load the copy uploaded next to this page.
+  if (!window.AFRAME) { document.write('<script src="aframe.min.js"><\/script>'); }
+</script>
+<script>
+  window.GAME_TICKS = [];
+  if (window.AFRAME) {
+    AFRAME.registerComponent('game-loop', {
+      tick: function (t, dt) {
+        var d = Math.min(dt || 16, 60) / 1000;
+        for (var i = 0; i < GAME_TICKS.length; i++) GAME_TICKS[i](d, t / 1000);
+      }
+    });
+  }
+</script>
+<style>
+  html, body { margin: 0; background: #000; }
+  #noaf { display: none; color: #f3e6c8; font-family: Georgia, serif; padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="noaf">The 3D engine could not load. Make sure <b>aframe.min.js</b> is uploaded next to this page.</div>
+
+<a-scene id="scene"
+  game-loop
+  light="defaultLightsEnabled: false"
+  renderer="antialias: true; colorManagement: true; foveationLevel: 1"
+  background="color: #000000"
+  fog="type: exponential; color: #050302; density: 0.045"
+  cursor="rayOrigin: mouse"
+  raycaster="objects: .clickable; far: 30"
+  xr-mode-ui="enabled: true; XRMode: vr"
+  loading-screen="dotsColor: #c0392b; backgroundColor: #000000">
+
+  <a-entity id="rig">
+    <a-entity id="cam" camera look-controls="pointerLockEnabled: false; magicWindowTrackingEnabled: false" wasd-controls="enabled: false" position="0 1.6 0"></a-entity>
+    <a-entity id="rh" laser-controls="hand: right; model: false" raycaster="objects: .clickable; far: 30; lineColor: #ffb347; lineOpacity: 0.85"></a-entity>
+    <a-entity id="lh" laser-controls="hand: left; model: false" raycaster="objects: .clickable; far: 30; lineColor: #ffb347; lineOpacity: 0.85"></a-entity>
+  </a-entity>
+
+  <a-entity id="hudRoot"></a-entity>
+  <a-entity id="levelRoot"></a-entity>
+</a-scene>
+
+<script>
+(function () {
+'use strict';
+if (!window.AFRAME) { document.getElementById('noaf').style.display = 'block'; return; }
+
+var $ = function (s) { return document.querySelector(s); };
+var scene = $('#scene');
+var levelRoot, hudRoot;
+var STATE = { level: 0, mistakes: 0, hints: 0, start: 0, hint: '', token: 0 };
+var levelUpdaters = [];
+var PX = 512;           // canvas pixels per meter
+var Z = -2.5;           // distance of the puzzle wall in front of the player
+var FS = 1.55;          // text size multiplier for readability in the headset
+
+/* ---------------- helpers ---------------- */
+function shuffle(a) { a = a.slice(); for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+function later(fn, ms) { var tok = STATE.token; return setTimeout(function () { if (tok === STATE.token) fn(); }, ms); }
+function deg(r) { return r * 180 / Math.PI; }
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function wrapLines(g, text, maxW) {
+  var out = [];
+  String(text).split('\n').forEach(function (par) {
+    if (par === '') { out.push(''); return; }
+    var words = par.split(' '), line = '';
+    words.forEach(function (w) {
+      var test = line ? line + ' ' + w : w;
+      if (g.measureText(test).width > maxW && line) { out.push(line); line = w; } else { line = test; }
+    });
+    out.push(line);
+  });
+  return out;
+}
+function makeSurface(w, h) {
+  var c = document.createElement('canvas');
+  c.width = Math.round(w * PX); c.height = Math.round(h * PX);
+  var tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  var mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, fog: false });
+  var mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  return { c: c, g: c.getContext('2d'), tex: tex, mesh: mesh, mat: mat, w: w, h: h };
+}
+function addEntity(parent, obj, x, y, z, rot) {
+  var el = document.createElement('a-entity');
+  el.setAttribute('position', x + ' ' + y + ' ' + z);
+  if (rot) el.setAttribute('rotation', rot);
+  parent.appendChild(el);
+  el.setObject3D('mesh', obj);
+  return el;
+}
+function removeEl(el) { if (el && el.parentNode) el.parentNode.removeChild(el); }
+function refreshRays() {
+  setTimeout(function () {
+    ['#scene', '#rh', '#lh'].forEach(function (s) {
+      var e = $(s);
+      if (e && e.components && e.components.raycaster) e.components.raycaster.refreshObjects();
+    });
+  }, 30);
+}
+
+/* ---------------- panels and buttons ---------------- */
+function drawPanel(s, o) {
+  var g = s.g, W = s.c.width, H = s.c.height, pad = o.pad || 36;
+  g.clearRect(0, 0, W, H);
+  roundRect(g, 4, 4, W - 8, H - 8, 26);
+  g.fillStyle = o.bg || 'rgba(20,11,6,0.93)'; g.fill();
+  g.lineWidth = 6; g.strokeStyle = o.border || '#8b5a2b'; g.stroke();
+  g.textBaseline = 'top';
+  var ts = Math.round((o.titleSize || 38) * FS), fs = Math.round((o.bodySize || 26) * FS), lines = [], lh = 0;
+  var titleH = o.title ? ts * 1.35 : 0;
+  if (o.body) {
+    g.font = fs + 'px Georgia, "Times New Roman", serif';
+    lines = wrapLines(g, o.body, W - pad * 2); lh = fs * 1.3;
+    while (titleH + lines.length * lh > H - pad * 1.6 && fs > 14) {
+      fs -= 1; g.font = fs + 'px Georgia, "Times New Roman", serif';
+      lines = wrapLines(g, o.body, W - pad * 2); lh = fs * 1.3;
+    }
+  }
+  var y = Math.max(pad * 0.8, (H - (titleH + lines.length * lh)) / 2);
+  if (o.title) {
+    g.font = 'bold ' + ts + 'px Georgia, "Times New Roman", serif';
+    g.fillStyle = o.titleColor || '#e8c27a'; g.textAlign = 'center';
+    g.fillText(o.title, W / 2, y); y += titleH;
+  }
+  if (o.body) {
+    g.font = fs + 'px Georgia, "Times New Roman", serif';
+    g.fillStyle = o.color || '#f3e6c8'; g.textAlign = 'center';
+    lines.forEach(function (l) { g.fillText(l, W / 2, y); y += lh; });
+  }
+  s.tex.needsUpdate = true;
+}
+function makePanel(parent, o) {
+  var s = makeSurface(o.w, o.h);
+  var p = { s: s, opts: o };
+  p.set = function (n) { for (var k in n) p.opts[k] = n[k]; drawPanel(s, p.opts); };
+  drawPanel(s, o);
+  p.el = addEntity(parent, s.mesh, o.x || 0, o.y || 0, o.z || 0, o.rot);
+  return p;
+}
+function makeButton(parent, label, o) {
+  o = o || {};
+  var w = o.w || 1.6, h = o.h || 0.26, size = Math.round((o.size || 24) * FS);
+  var s = makeSurface(w, h);
+  var b = { s: s, label: label, state: 'normal', enabled: true, hovered: false, last: 0 };
+  b.draw = function () {
+    var g = s.g, W = s.c.width, H = s.c.height, bg;
+    g.clearRect(0, 0, W, H);
+    if (b.state === 'good') bg = '#1f5a2a';
+    else if (b.state === 'bad') bg = '#7a1717';
+    else if (b.state === 'sel') bg = '#8a6512';
+    else bg = (b.hovered && b.enabled) ? '#7a4220' : (o.color || '#3b2414');
+    roundRect(g, 4, 4, W - 8, H - 8, Math.min(22, H / 3));
+    g.fillStyle = bg; g.fill();
+    g.lineWidth = 5; g.strokeStyle = (b.hovered && b.enabled) ? '#ffd27a' : '#c9963b'; g.stroke();
+    g.fillStyle = '#f6e7c8'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    var fs = size; g.font = 'bold ' + fs + 'px Georgia, serif';
+    var lines = wrapLines(g, b.label, W - 30);
+    while (lines.length * fs * 1.2 > H - 10 && fs > 13) { fs -= 1; g.font = 'bold ' + fs + 'px Georgia, serif'; lines = wrapLines(g, b.label, W - 30); }
+    var lh = fs * 1.2, yy = H / 2 - (lines.length - 1) * lh / 2;
+    lines.forEach(function (l) { g.fillText(l, W / 2, yy); yy += lh; });
+    s.tex.needsUpdate = true;
+  };
+  b.draw();
+  b.el = addEntity(parent, s.mesh, o.x || 0, o.y || 0, o.z || 0, o.rot);
+  b.el.classList.add('clickable');
+  b.el.dataset.label = label;
+  b.el.addEventListener('mouseenter', function () { b.hovered = true; b.draw(); if (b.enabled) blip(880, 0.04, 'sine', 0.03); });
+  b.el.addEventListener('mouseleave', function () { b.hovered = false; b.draw(); });
+  b.el.addEventListener('click', function () {
+    if (!b.enabled) return;
+    var now = performance.now(); if (now - b.last < 350) return; b.last = now;
+    initAudio();
+    if (o.onClick) o.onClick(b);
+  });
+  b.setState = function (st) { b.state = st; b.draw(); };
+  b.setLabel = function (l) { b.label = l; b.draw(); };
+  b.disable = function () { b.enabled = false; b.el.classList.remove('clickable'); b.draw(); refreshRays(); };
+  b.enable = function () { b.enabled = true; b.el.classList.add('clickable'); b.draw(); refreshRays(); };
+  b.remove = function () { removeEl(b.el); };
+  return b;
+}
+
+/* ---------------- sound (made in the browser, no files) ---------------- */
+var AC = null, master = null;
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.7; master.connect(AC.destination);
+    [55, 55.6, 82.4].forEach(function (f, i) {
+      var osc = AC.createOscillator(); osc.type = 'sawtooth'; osc.frequency.value = f;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 170;
+      var gn = AC.createGain(); gn.gain.value = i === 2 ? 0.012 : 0.028;
+      osc.connect(lp); lp.connect(gn); gn.connect(master); osc.start();
+    });
+  } catch (e) { AC = null; }
+}
+function blip(f, d, type, v, delay) {
+  if (!AC) return;
+  var t = AC.currentTime + (delay || 0);
+  var o = AC.createOscillator(), gn = AC.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(f, t);
+  gn.gain.setValueAtTime(0.0001, t);
+  gn.gain.exponentialRampToValueAtTime(v || 0.15, t + 0.02);
+  gn.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(gn); gn.connect(master); o.start(t); o.stop(t + d + 0.05);
+}
+function noise(d, v, freq, delay) {
+  if (!AC) return;
+  var t = AC.currentTime + (delay || 0);
+  var len = Math.max(1, Math.floor(AC.sampleRate * d));
+  var buf = AC.createBuffer(1, len, AC.sampleRate), data = buf.getChannelData(0);
+  for (var i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  var src = AC.createBufferSource(); src.buffer = buf;
+  var f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq || 800;
+  var gn = AC.createGain(); gn.gain.value = v || 0.2;
+  src.connect(f); f.connect(gn); gn.connect(master); src.start(t);
+}
+var SFX = {
+  good: function () { blip(523, 0.15, 'triangle', 0.2); blip(784, 0.28, 'triangle', 0.2, 0.1); },
+  bad: function () { blip(140, 0.35, 'sawtooth', 0.16); blip(104, 0.45, 'sawtooth', 0.14, 0.12); },
+  collect: function () { blip(660, 0.12, 'sine', 0.2); blip(990, 0.22, 'sine', 0.15, 0.08); },
+  swoosh: function (v) { noise(0.4, v, 1500); },
+  scurry: function () { for (var i = 0; i < 16; i++) noise(0.04, 0.25, 2800 + Math.random() * 2400, i * 0.06); },
+  rumble: function () { noise(1.0, 0.45, 120); },
+  fanfare: function () {
+    [392, 523, 659, 784].forEach(function (f, i) { blip(f, 0.45, 'square', 0.07, i * 0.16); });
+    [523, 659, 784].forEach(function (f) { blip(f, 1.4, 'square', 0.06, 0.75); });
+  }
+};
+
+/* ---------------- the dungeon ---------------- */
+var walls = {}, wallMats = [], eyes = [], torches = [], hemi, camLight, pend = null;
+
+function stoneTexture(dark) {
+  var c = document.createElement('canvas'); c.width = c.height = 512;
+  var g = c.getContext('2d');
+  g.fillStyle = dark ? '#100c0a' : '#1e1814'; g.fillRect(0, 0, 512, 512);
+  var bh = 64;
+  for (var r = 0; r < 8; r++) {
+    var off = (r % 2) * 48;
+    for (var x = -96; x < 512; x += 96) {
+      var sh = (dark ? 18 : 34) + Math.random() * 26;
+      g.fillStyle = 'rgb(' + Math.round(sh + 12) + ',' + Math.round(sh + 6) + ',' + Math.round(sh) + ')';
+      g.fillRect(x + off + 3, r * bh + 3, 90, bh - 6);
+      for (var k = 0; k < 30; k++) {
+        g.fillStyle = 'rgba(0,0,0,' + (Math.random() * 0.3).toFixed(2) + ')';
+        g.fillRect(x + off + 3 + Math.random() * 88, r * bh + 3 + Math.random() * (bh - 8), 2 + Math.random() * 5, 2 + Math.random() * 5);
+      }
+    }
+  }
+  var tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+function stoneMat(base, rx, ry) {
+  var t = base.clone(); t.needsUpdate = true; t.repeat.set(rx, ry);
+  var m = new THREE.MeshStandardMaterial({ map: t, emissiveMap: t, roughness: 0.95, metalness: 0, emissive: 0x000000 });
+  wallMats.push(m);
+  return m;
+}
+
+function buildRoom() {
+  var root = scene.object3D;
+  var tex = stoneTexture(false), dtex = stoneTexture(true);
+
+  function wall(w, h, pos, rotY, name) {
+    var m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), stoneMat(tex, w / 2, h / 2));
+    m.position.set(pos[0], pos[1], pos[2]); m.rotation.y = rotY; root.add(m); walls[name] = m; return m;
+  }
+  wall(10, 6, [-5, 3, -2], Math.PI / 2, 'left');
+  wall(10, 6, [5, 3, -2], -Math.PI / 2, 'right');
+  wall(10, 6, [0, 3, -7], 0, 'back');
+  wall(10, 6, [0, 3, 3], Math.PI, 'front');
+  var ceil = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), stoneMat(dtex, 5, 5));
+  ceil.position.set(0, 6, -2); ceil.rotation.x = Math.PI / 2; root.add(ceil);
+
+  // Floor with a round hole for the pit
+  var s = new THREE.Shape();
+  s.moveTo(-5, -5); s.lineTo(5, -5); s.lineTo(5, 5); s.lineTo(-5, 5); s.lineTo(-5, -5);
+  var hole = new THREE.Path(); hole.absarc(0, 0.5, 1.3, 0, Math.PI * 2, true); s.holes.push(hole);
+  var fm = stoneMat(tex, 0.5, 0.5);
+  var floor = new THREE.Mesh(new THREE.ShapeGeometry(s, 48), fm);
+  floor.rotation.x = -Math.PI / 2; floor.position.set(0, 0, -2); root.add(floor);
+
+  // The pit
+  var pitWall = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.3, 9, 32, 1, true),
+    new THREE.MeshStandardMaterial({ map: (function () { var t = dtex.clone(); t.needsUpdate = true; t.repeat.set(4, 4); return t; })(), side: THREE.BackSide, roughness: 1 }));
+  pitWall.position.set(0, -4.5, -2.5); root.add(pitWall);
+  var pitGlow = new THREE.Mesh(new THREE.CircleGeometry(1.3, 32), new THREE.MeshBasicMaterial({ color: 0x2a0600, fog: false }));
+  pitGlow.rotation.x = -Math.PI / 2; pitGlow.position.set(0, -8.9, -2.5); root.add(pitGlow);
+  var rim = new THREE.Mesh(new THREE.TorusGeometry(1.36, 0.07, 8, 48), new THREE.MeshStandardMaterial({ color: 0x2b231d, roughness: 1 }));
+  rim.rotation.x = Math.PI / 2; rim.position.set(0, 0.03, -2.5); root.add(rim);
+
+  // Painted fiends' eyes on the walls
+  var eyeSpots = { left: [[-3, 1.2], [0.5, 0.6], [3.2, 1.6]], right: [[-3.2, 1.4], [0.2, 0.9], [3, 1.3]], back: [[-3, 1], [2.6, 1.5]] };
+  Object.keys(eyeSpots).forEach(function (name) {
+    eyeSpots[name].forEach(function (p) {
+      [-0.14, 0.14].forEach(function (dx) {
+        var e = new THREE.Mesh(new THREE.CircleGeometry(0.07, 16), new THREE.MeshBasicMaterial({ color: 0xff2a10, transparent: true, opacity: 0.1, fog: false }));
+        e.position.set(p[0] + dx, p[1], 0.02); walls[name].add(e); eyes.push(e);
+      });
+    });
+  });
+
+  // Torches in the four corners
+  [[-4.8, 2.6, -6.8], [4.8, 2.6, -6.8], [-4.8, 2.6, 2.8], [4.8, 2.6, 2.8]].forEach(function (p, i) {
+    var grp = new THREE.Group(); grp.position.set(p[0], p[1], p[2]);
+    var stick = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.03, 0.5, 8), new THREE.MeshStandardMaterial({ color: 0x3a2412 }));
+    grp.add(stick);
+    var flame = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.3, 10), new THREE.MeshBasicMaterial({ color: 0xffa040, fog: false }));
+    flame.position.y = 0.38; grp.add(flame);
+    var light = new THREE.PointLight(0xff8a3d, 6, 11, 1.4); light.position.y = 0.45; grp.add(light);
+    root.add(grp);
+    torches.push({ grp: grp, flame: flame, light: light, i: i });
+  });
+
+  hemi = new THREE.HemisphereLight(0x664433, 0x110805, 0.9);
+  root.add(hemi);
+
+  camLight = new THREE.PointLight(0xffb070, 1.2, 6, 1.3);
+  $('#cam').object3D.add(camLight);
+
+  // Small glowing torches on the controllers (replaces downloaded controller models)
+  ['#rh', '#lh'].forEach(function (s) {
+    var g = new THREE.Group();
+    var handle = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.14, 8), new THREE.MeshStandardMaterial({ color: 0x4a2c16 }));
+    handle.rotation.x = Math.PI / 2; g.add(handle);
+    var tip = new THREE.Mesh(new THREE.SphereGeometry(0.025, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffb347 }));
+    tip.position.z = -0.08; g.add(tip);
+    $(s).object3D.add(g);
+  });
+}
+
+var dark = false;
+function setDarkness(on) {
+  dark = on;
+  torches.forEach(function (t) { t.grp.visible = !on; });
+  hemi.intensity = on ? 0.05 : 0.9;
+  camLight.intensity = on ? 1.6 : 1.0;
+}
+function setEyes(op) { eyes.forEach(function (e) { e.material.opacity = op; }); }
+function setWallHeat(h) {
+  wallMats.forEach(function (m) { m.emissive.setRGB(h * 3.0, h * 0.5, h * 0.05); });
+}
+function resetWalls() {
+  walls.left.position.x = -5; walls.right.position.x = 5;
+  setWallHeat(0); setEyes(0.1);
+}
+
+/* ---------------- rats ---------------- */
+var rats = [];
+function makeRat() {
+  var g = new THREE.Group();
+  var mat = new THREE.MeshStandardMaterial({ color: 0x3b302a, roughness: 0.9 });
+  var body = new THREE.Mesh(new THREE.SphereGeometry(0.06, 10, 8), mat);
+  body.scale.set(1, 0.75, 1.9); body.position.y = 0.045; g.add(body);
+  var head = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), mat);
+  head.position.set(0, 0.05, 0.12); head.scale.set(1, 0.9, 1.4); g.add(head);
+  var tail = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.003, 0.22, 4), new THREE.MeshStandardMaterial({ color: 0x8a6a60 }));
+  tail.rotation.x = Math.PI / 2 - 0.15; tail.position.set(0, 0.03, -0.21); g.add(tail);
+  var eyeM = new THREE.MeshBasicMaterial({ color: 0xff2222 });
+  [-1, 1].forEach(function (sd) { var e = new THREE.Mesh(new THREE.SphereGeometry(0.008, 5, 4), eyeM); e.position.set(0.018 * sd, 0.065, 0.165); g.add(e); });
+  return g;
+}
+function spawnRats(n, life) {
+  for (var i = 0; i < n; i++) {
+    var r = makeRat(), side = Math.random() < 0.5 ? -1 : 1;
+    r.position.set(side * (3 + Math.random() * 1.5), 0, -1.1 + Math.random() * 3);
+    scene.object3D.add(r);
+    rats.push({ o: r, t: 0, life: (life || 5) + Math.random() * 1.5, tx: (Math.random() - 0.5) * 1.2, tz: 0.3 - Math.random() * 1.3, speed: 1.3 + Math.random() * 1.3, phase: Math.random() * 10, leaving: false });
+  }
+  SFX.scurry(); later(SFX.scurry, 1100);
+}
+function updateRats(d) {
+  for (var i = rats.length - 1; i >= 0; i--) {
+    var r = rats[i]; r.t += d;
+    if (r.t > r.life * 0.6 && !r.leaving) {
+      r.leaving = true; var a = Math.random() * Math.PI * 2;
+      r.tx = r.o.position.x + Math.cos(a) * 6; r.tz = r.o.position.z + Math.sin(a) * 6;
+    }
+    var dx = r.tx - r.o.position.x, dz = r.tz - r.o.position.z, dist = Math.hypot(dx, dz);
+    if (dist > 0.05) {
+      var step = Math.min(dist, r.speed * d);
+      r.o.position.x += dx / dist * step; r.o.position.z += dz / dist * step;
+      r.o.rotation.y = Math.atan2(dx, dz) + Math.sin(r.t * 22 + r.phase) * 0.25;
+    } else { r.o.rotation.y += Math.sin(r.t * 9 + r.phase) * 0.05; }
+    if (r.t > r.life) { scene.object3D.remove(r.o); rats.splice(i, 1); }
+  }
+}
+
+/* ---------------- the pendulum ---------------- */
+function buildPendulum() {
+  var pivot = new THREE.Group(); pivot.position.set(0, 5.95, -1.3);
+  var steel = new THREE.MeshStandardMaterial({ color: 0x8a8a8a, metalness: 0.85, roughness: 0.35 });
+  var rod = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1, 8), steel);
+  pivot.add(rod);
+  var holder = new THREE.Group(); pivot.add(holder);
+  var blade = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.78, 48, 1, Math.PI * 1.06, Math.PI * 0.88),
+    new THREE.MeshStandardMaterial({ color: 0xd5d9dc, metalness: 0.9, roughness: 0.18, side: THREE.DoubleSide, emissive: 0x222222 }));
+  blade.position.y = 0.33; holder.add(blade);
+  // the painted figure of Time on the ceiling
+  var time = makeSurface(1.6, 1.6);
+  (function (g) {
+    var W = time.c.width; g.clearRect(0, 0, W, W);
+    g.strokeStyle = 'rgba(200,150,90,0.55)'; g.lineWidth = 10;
+    g.beginPath(); g.arc(W / 2, W / 2, W * 0.44, 0, Math.PI * 2); g.stroke();
+    g.font = 'bold 70px Georgia, serif'; g.fillStyle = 'rgba(220,170,100,0.6)'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    ['XII', 'III', 'VI', 'IX'].forEach(function (n, i) { var a = i * Math.PI / 2 - Math.PI / 2; g.fillText(n, W / 2 + Math.cos(a) * W * 0.34, W / 2 + Math.sin(a) * W * 0.34); });
+    g.fillText('TIME', W / 2, W / 2);
+    time.tex.needsUpdate = true;
+  })(time.g);
+  time.mesh.rotation.x = Math.PI / 2; time.mesh.position.set(0, 5.97, -1.3);
+  var grp = new THREE.Group(); grp.add(pivot); grp.add(time.mesh);
+  scene.object3D.add(grp);
+  pend = { grp: grp, pivot: pivot, rod: rod, holder: holder };
+  setPendLength(2.2);
+}
+function setPendLength(L) { pend.rod.scale.y = L; pend.rod.position.y = -L / 2; pend.holder.position.y = -L; }
+function removePendulum() { if (pend) { scene.object3D.remove(pend.grp); pend = null; } }
+
+/* ---------------- HUD ---------------- */
+var hud = {};
+function buildHud() {
+  hud.status = makePanel(hudRoot, { w: 1.95, h: 0.3, x: -0.33, y: 0.7, z: Z, rot: '-19 0 0', bodySize: 24, pad: 16, body: '' });
+  hud.hint = makeButton(hudRoot, 'HINT', { w: 0.6, h: 0.3, x: 1.05, y: 0.7, z: Z, rot: '-19 0 0', size: 26, onClick: function () {
+    STATE.hints++; showStatus('HINT: ' + STATE.hint, 11000);
+  } });
+  showHud(false);
+}
+var statusTimer = null;
+function statusText() {
+  return 'Chamber ' + STATE.level + ' of 6   ·   Mistakes: ' + STATE.mistakes + '   ·   Hints: ' + STATE.hints;
+}
+function showStatus(text, ms) {
+  clearTimeout(statusTimer);
+  hud.status.set({ body: text, bodySize: text.length > 70 ? 19 : 24 });
+  if (ms) statusTimer = setTimeout(function () { hud.status.set({ body: statusText(), bodySize: 24 }); }, ms);
+}
+function updateStatus() { showStatus(statusText()); }
+function showHud(on) {
+  hudRoot.object3D.visible = on;
+  if (on) hud.hint.enable(); else hud.hint.disable();
+}
+function addMistake() { STATE.mistakes++; updateStatus(); }
+function setLevelMeta(n, hint) { STATE.level = n; STATE.hint = hint; showHud(true); updateStatus(); }
+
+/* ---------------- level plumbing ---------------- */
+function clearLevel() {
+  STATE.token++;
+  while (levelRoot.firstChild) levelRoot.removeChild(levelRoot.firstChild);
+  levelUpdaters = [];
+  removePendulum();
+  resetWalls();
+  refreshRays();
+}
+function continueButton(y, label, next) {
+  var b = makeButton(levelRoot, label || 'CONTINUE', { w: 0.95, h: 0.3, x: 0, y: y, z: Z, size: 28, onClick: function () { b.disable(); next(); } });
+  refreshRays();
+  return b;
+}
+
+// Generic multiple-choice runner (first answer in each list is correct)
+function runQuiz(title, intro, qs, onDone, onWrong) {
+  var i = 0, btns = [];
+  var panel = makePanel(levelRoot, { w: 2.2, h: 1.05, x: 0, y: 2.27, z: Z, title: title, titleSize: 34, bodySize: 25 });
+  function clearBtns() { btns.forEach(function (b) { b.remove(); }); btns = []; }
+  function show() {
+    clearBtns();
+    var q = qs[i]; STATE.hint = q.hint;
+    panel.set({ body: (i === 0 && intro ? intro + '\n\n' : '') + 'Question ' + (i + 1) + ' of ' + qs.length + ':  ' + q.q });
+    shuffle(q.a.map(function (t, k) { return { t: t, k: k }; })).forEach(function (o, j) {
+      var b = makeButton(levelRoot, o.t, { w: 2.0, h: 0.25, x: 0, y: 1.57 - j * 0.29, z: Z, size: 23, onClick: function () {
+        if (o.k === 0) {
+          b.setState('good'); SFX.good(); btns.forEach(function (x) { x.disable(); });
+          later(function () { i++; if (i < qs.length) show(); else { clearBtns(); onDone(panel); } }, 750);
+        } else {
+          b.setState('bad'); b.disable(); SFX.bad(); addMistake(); if (onWrong) onWrong();
+        }
+      } });
+      btns.push(b);
+    });
+    refreshRays();
+  }
+  show();
+  return panel;
+}
+
+/* ---------------- INTRO ---------------- */
+function intro() {
+  clearLevel(); showHud(false); setDarkness(true);
+  makePanel(levelRoot, { w: 2.3, h: 1.45, x: 0, y: 1.75, z: Z, title: 'ESCAPE THE PIT', titleSize: 52,
+    body: 'Toledo, Spain. The judges of the Inquisition have sentenced you to death.\nYou are the prisoner. Poe never gave him a name, so the prisoner is you.\n\nTo choose: point your controller and pull the TRIGGER.\n(On a computer: drag to look around, click to choose.)\n\nLook all around you. Clues hide in the dark.\nAnd watch your step... there is a pit.', bodySize: 25 });
+  continueButton(0.85, 'BEGIN', function () { STATE.start = performance.now(); STATE.mistakes = 0; STATE.hints = 0; level1(); });
+}
+
+/* ---------------- CHAMBER I: THE DARKNESS ---------------- */
+function level1() {
+  clearLevel(); setDarkness(true);
+  setLevelMeta(1, 'Turn your whole body. One letter is behind you, one is high up near the ceiling, and two are on the side walls.');
+  var panel = makePanel(levelRoot, { w: 2.1, h: 0.9, x: 0, y: 2.15, z: Z, title: 'CHAMBER I · THE DARKNESS', titleSize: 34,
+    body: 'You wake on cold stone in total darkness. Four letters glow faintly somewhere on the dungeon walls.\nTurn around. Point at each letter and pull the trigger to collect it.', bodySize: 25 });
+  var collected = [];
+  var slots = makePanel(levelRoot, { w: 1.3, h: 0.36, x: 0, y: 1.47, z: Z, body: '', bodySize: 40, pad: 22 });
+  function drawSlots(arr) {
+    var t = []; for (var i = 0; i < 4; i++) t.push(arr[i] || '_');
+    slots.set({ body: t.join('   ') });
+  }
+  drawSlots([]);
+  var player = new THREE.Vector3(0, 1.6, 0);
+  var spots = [
+    { ch: 'R', p: [-4.88, 1.5, -1.0] },
+    { ch: 'A', p: [2.8, 4.3, -6.88] },
+    { ch: 'T', p: [-1.3, 0.85, 2.88] },
+    { ch: 'S', p: [4.88, 2.4, 0.8] }
+  ];
+  var meshes = [];
+  spots.forEach(function (sp, idx) {
+    var s = makeSurface(0.7, 0.7), g = s.g, W = s.c.width;
+    var grd = g.createRadialGradient(W / 2, W / 2, 10, W / 2, W / 2, W / 2);
+    grd.addColorStop(0, 'rgba(255,150,40,0.35)'); grd.addColorStop(1, 'rgba(255,120,20,0)');
+    g.fillStyle = grd; g.fillRect(0, 0, W, W);
+    g.font = 'bold 260px Georgia, serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.shadowColor = '#ff8c1a'; g.shadowBlur = 30; g.fillStyle = '#ffc067';
+    g.fillText(sp.ch, W / 2, W / 2 + 10); s.tex.needsUpdate = true;
+    var dx = player.x - sp.p[0], dy = player.y - sp.p[1], dz = player.z - sp.p[2];
+    var ry = deg(Math.atan2(dx, dz)), rx = deg(Math.atan2(-dy, Math.hypot(dx, dz)));
+    var el = addEntity(levelRoot, s.mesh, sp.p[0], sp.p[1], sp.p[2], rx + ' ' + ry + ' 0');
+    el.classList.add('clickable');
+    meshes.push(s.mat);
+    var got = false;
+    el.addEventListener('mouseenter', function () { el.object3D.scale.set(1.2, 1.2, 1.2); });
+    el.addEventListener('mouseleave', function () { el.object3D.scale.set(1, 1, 1); });
+    el.addEventListener('click', function () {
+      if (got) return; got = true; initAudio(); SFX.collect();
+      removeEl(el); collected.push(sp.ch); drawSlots(collected); refreshRays();
+      if (collected.length === 4) later(spellPhase, 600);
+    });
+  });
+  levelUpdaters.push(function (d, t) { meshes.forEach(function (m, i) { m.opacity = 0.55 + 0.4 * Math.sin(t * 2.2 + i * 1.7); }); });
+  refreshRays();
+
+  function spellPhase() {
+    STATE.hint = 'In Poe\'s story, small creatures in the dark save the prisoner\'s life. What are they?';
+    panel.set({ title: 'SPELL THE WORD', body: 'You found all four letters. Click them in order to spell the creatures that will one day save your life.' });
+    var typed = [], tiles = [];
+    drawSlots(typed);
+    shuffle(['R', 'A', 'T', 'S']).forEach(function (ch, i) {
+      var b = makeButton(levelRoot, ch, { w: 0.34, h: 0.34, x: -0.6 + i * 0.4, y: 1.08, z: Z, size: 44, onClick: function () {
+        b.disable(); typed.push(ch); drawSlots(typed); blip(500 + typed.length * 90, 0.1, 'sine', 0.12);
+        if (typed.length === 4) {
+          if (typed.join('') === 'RATS') { later(success, 300); }
+          else {
+            SFX.bad(); addMistake();
+            later(function () { typed = []; drawSlots(typed); tiles.forEach(function (x) { x.setState('normal'); x.enable(); }); }, 700);
+          }
+        }
+      } });
+      tiles.push(b);
+    });
+    refreshRays();
+    function success() {
+      tiles.forEach(function (x) { x.remove(); });
+      SFX.good(); spawnRats(10, 4);
+      slots.set({ body: 'R   A   T   S' });
+      panel.set({ title: 'RATS', body: 'Something scurries across your feet in the dark!\nRemember this word. In Poe\'s story, help comes from the last place anyone would expect.' });
+      continueButton(1.08, 'CONTINUE', level2);
+    }
+  }
+}
+
+/* ---------------- CHAMBER II: THE TRIBUNAL ---------------- */
+function level2() {
+  clearLevel(); setDarkness(false); SFX.rumble();
+  setLevelMeta(2, 'Think back to the very beginning of the story.');
+  runQuiz('CHAMBER II · THE TRIBUNAL', 'Torches flare. Black-robed judges stare down at you. Answer them correctly.', [
+    { q: 'Who sentences the narrator to death at the start of the story?', a: ['The judges of the Inquisition', 'General Lasalle', 'The king of France'], hint: 'They are dressed in black robes, and they work for the Spanish Inquisition.' },
+    { q: 'While feeling his way around the dark dungeon, what does he almost fall into?', a: ['A deep pit in the center of the floor', 'A rushing underground river', 'A trapdoor into the guards\' room'], hint: 'Look down. It\'s right in front of you.' },
+    { q: 'Poe never gives the narrator a name. What effect does that have?', a: ['It lets the reader imagine being the prisoner', 'It shows the narrator is the villain', 'It means the story is not finished'], hint: 'Without a name, who could the prisoner be?' }
+  ], function (panel) {
+    panel.set({ title: 'THE TRIBUNAL FALLS SILENT', body: 'The judges turn away. A guard hands you a jug of water... it tastes strange.\nYour eyes grow heavy. You sink into a drugged sleep.' });
+    continueButton(1.45, 'CONTINUE', level3);
+  });
+}
+
+/* ---------------- CHAMBER III: THE PAINTED WALLS ---------------- */
+function level3() {
+  clearLevel(); setDarkness(false); setEyes(0.35);
+  setLevelMeta(3, 'The Pit = death and fear of the unknown. Then ask: what does each object DO to the prisoner?');
+  var panel = makePanel(levelRoot, { w: 2.7, h: 0.48, x: 0, y: 2.6, z: Z, title: 'CHAMBER III · THE PAINTED WALLS', titleSize: 30, pad: 18,
+    body: 'Fiends\' eyes watch from the walls. Pick a SYMBOL on the left, then its MEANING on the right.', bodySize: 22 });
+  var pairs = [['The Pit', 'Death and fear of the unknown'], ['The Pendulum', 'Time running out'], ['The Closing Walls', 'Being trapped and helpless'], ['The Rats', 'Hope from an unexpected place'], ['The Darkness', 'Fear and uncertainty']];
+  var ys = [2.17, 1.89, 1.61, 1.33, 1.05], sel = null, matched = 0;
+  shuffle([0, 1, 2, 3, 4]).forEach(function (pi, row) {
+    var b = makeButton(levelRoot, pairs[pi][0], { w: 1.05, h: 0.24, x: -0.82, y: ys[row], z: Z, size: 24, onClick: function () {
+      if (sel && sel.enabled) sel.setState('normal'); sel = b; b.setState('sel'); blip(620, 0.08, 'sine', 0.1);
+    } });
+    b.pi = pi;
+  });
+  shuffle([0, 1, 2, 3, 4]).forEach(function (pi, row) {
+    var b = makeButton(levelRoot, pairs[pi][1], { w: 1.45, h: 0.24, x: 0.55, y: ys[row], z: Z, size: 22, onClick: function () {
+      if (!sel) { showStatus('Pick a symbol on the left first.', 2500); return; }
+      if (sel.pi === b.pi) {
+        sel.setState('good'); sel.disable(); b.setState('good'); b.disable(); sel = null; SFX.good(); matched++;
+        if (matched === 5) later(done, 700);
+      } else {
+        b.setState('bad'); SFX.bad(); addMistake();
+        later(function () { if (b.enabled) b.setState('normal'); }, 650);
+      }
+    } });
+    b.pi = pi;
+  });
+  refreshRays();
+  function done() {
+    while (levelRoot.firstChild) levelRoot.removeChild(levelRoot.firstChild);
+    setEyes(0.1);
+    makePanel(levelRoot, { w: 2.2, h: 0.85, x: 0, y: 2.0, z: Z, title: 'THE EYES GROW DIM', titleSize: 34,
+      body: 'You understand the dungeon now. But you are so tired...\nWhen you wake, you are strapped flat to a wooden frame. Something swings above you.' });
+    continueButton(1.3, 'CONTINUE', level4);
+  }
+}
+
+/* ---------------- CHAMBER IV: THE PENDULUM ---------------- */
+function level4() {
+  clearLevel(); setDarkness(false); buildPendulum();
+  setLevelMeta(4, 'Every wrong answer drops the blade faster. Think about what the prisoner had on his plate.');
+  var L = 2.2, Lmax = 3.75, active = true, freed = false, lastSign = 0;
+  levelUpdaters.push(function (d, t) {
+    if (!pend) return;
+    if (active) L = Math.min(Lmax, L + d * ((Lmax - 2.2) / 110));
+    if (freed) L = Math.max(0.8, L - d * 1.2);
+    setPendLength(L);
+    var s = Math.sin(t * 1.7);
+    pend.pivot.rotation.z = 0.7 * s;
+    if ((s > 0) !== (lastSign > 0)) { var v = 0.1 + 0.5 * (L - 2.2) / (Lmax - 2.2); if (!freed) SFX.swoosh(v); }
+    lastSign = s;
+    if (!freed) setEyes(0.1 + 0.8 * (L - 2.2) / (Lmax - 2.2));
+    if (active && L >= Lmax) { active = false; fail(); }
+  });
+  runQuiz('CHAMBER IV · THE PENDULUM', 'You are strapped down. LOOK UP: a razor-sharp blade swings, lower with every pass. Answer fast!', [
+    { q: 'The pendulum drops slowly, swing after swing. What does it symbolize?', a: ['Time running out and death coming closer', 'The narrator\'s love for his family', 'The power of the French army'], hint: 'A pendulum is what makes a clock tick.' },
+    { q: 'You have a plate of food beside you. How does the narrator use it to escape?', a: ['He rubs the greasy meat on his straps', 'He throws it at the guards', 'He eats it to get strong enough to break free'], hint: 'Remember the word from Chamber I. What would rats want?' }
+  ], function (panel) {
+    STATE.hint = 'Do it now!';
+    panel.set({ title: 'THE RATS ARE WAITING', body: 'Dozens of hungry rats watch from the shadows. Use the food. Quickly!' });
+    var b = makeButton(levelRoot, 'RUB THE MEAT ON THE STRAPS', { w: 1.6, h: 0.32, x: 0, y: 1.45, z: Z, size: 26, onClick: function () {
+      b.remove(); spawnRats(18, 5.5);
+      panel.set({ title: 'THE RATS SWARM', body: 'They pour over your body, over your chest, your arms... and they chew through the straps!' });
+      later(function () {
+        active = false; freed = true; SFX.good();
+        panel.set({ title: 'YOU ARE FREE!', body: 'You roll off the frame just as the blade passes. The pendulum is pulled back up into the ceiling.\nYou are being watched. And the walls are starting to glow.' });
+        continueButton(1.45, 'CONTINUE', level5);
+      }, 3500);
+    } });
+    refreshRays();
+  }, function () { L = Math.min(Lmax, L + 0.35); });
+
+  function fail() {
+    while (levelRoot.firstChild) levelRoot.removeChild(levelRoot.firstChild);
+    SFX.bad();
+    makePanel(levelRoot, { w: 2.1, h: 0.75, x: 0, y: 2.0, z: Z, title: 'THE BLADE REACHES YOU', titleSize: 34,
+      body: 'It slices through your robe! You black out... and wake beneath the pendulum once again.' });
+    continueButton(1.4, 'TRY AGAIN', level4);
+  }
+}
+
+/* ---------------- CHAMBER V: THE BURNING WALLS ---------------- */
+function level5() {
+  clearLevel(); setDarkness(false); SFX.rumble();
+  setLevelMeta(5, 'Retrace the story: sentenced, darkness, pit, pendulum, rats... what came last?');
+  var wallX = 5, minX = 1.5, running = true;
+  levelUpdaters.push(function (d, t) {
+    if (running) wallX = Math.max(minX, wallX - d * ((5 - minX) / 140));
+    walls.left.position.x = -wallX; walls.right.position.x = wallX;
+    var heat = 0.2 + 0.8 * (5 - wallX) / (5 - minX);
+    setWallHeat(heat * (0.85 + 0.15 * Math.sin(t * 3)));
+    setEyes(Math.min(1, 0.3 + heat));
+    if (running && wallX <= minX) { running = false; fail(); }
+  });
+  var panel = makePanel(levelRoot, { w: 2.4, h: 0.62, x: 0, y: 2.48, z: Z, title: 'CHAMBER V · THE BURNING WALLS', titleSize: 30, pad: 18,
+    body: 'The walls glow red-hot and creep toward you! Click the story\'s events IN ORDER, first to last, to stop them.', bodySize: 23 });
+  var events = ['The judges sentence him to death', 'He wakes in total darkness', 'He nearly falls into the pit', 'He is strapped beneath the pendulum', 'Rats chew through his straps', 'The burning walls close in'];
+  var next = 0, cells = [];
+  shuffle([0, 1, 2, 3, 4, 5]).forEach(function (ei, k) {
+    var col = k % 2, row = Math.floor(k / 2);
+    var b = makeButton(levelRoot, events[ei], { w: 1.3, h: 0.32, x: col ? 0.68 : -0.68, y: 1.95 - row * 0.4, z: Z, size: 23, onClick: function () {
+      if (ei === next) {
+        next++; b.setLabel(next + '. ' + events[ei]); b.setState('good'); b.disable(); SFX.good();
+        if (next === 6) { running = false; later(win, 700); }
+      } else {
+        b.setState('bad'); SFX.bad(); addMistake(); wallX = Math.max(minX, wallX - 0.4);
+        showStatus('Wrong order! The walls lurch closer.', 2500);
+        later(function () { if (b.enabled) b.setState('normal'); }, 650);
+      }
+    } });
+    cells.push(b);
+  });
+  refreshRays();
+  function win() {
+    cells.forEach(function (c) { c.remove(); });
+    panel.set({ title: 'THE WALLS STOP', body: 'But the floor has tilted. Your heels are at the very edge of the pit.\nThen, far away... TRUMPETS!' });
+    continueButton(1.9, 'CONTINUE', level6);
+  }
+  function fail() {
+    cells.forEach(function (c) { c.remove(); });
+    SFX.bad();
+    panel.set({ title: 'NO ROOM LEFT', body: 'The glowing walls push you over the edge... you fall... and wake at the start of the chamber.' });
+    continueButton(1.9, 'TRY AGAIN', level5);
+  }
+}
+
+/* ---------------- CHAMBER VI: THE TRUMPETS ---------------- */
+function level6() {
+  clearLevel(); setDarkness(false); setWallHeat(0.12); walls.left.position.x = -3; walls.right.position.x = 3;
+  setLevelMeta(6, 'Watch which trumpet lights up first, second, and so on. Press PLAY THE CALL to hear it again.');
+  var panel = makePanel(levelRoot, { w: 2.2, h: 0.72, x: 0, y: 2.55, z: Z, title: 'CHAMBER VI · THE TRUMPETS', titleSize: 32, pad: 18,
+    body: 'An army is outside! Watch and listen to the trumpet call, then repeat it by pointing at the trumpets in the same order.', bodySize: 23 });
+  var colors = [0xd4a017, 0xb3202a, 0x2a4fb3, 0x2a8f3c], tones = [392, 523, 659, 784];
+  var horns = [];
+  colors.forEach(function (col, i) {
+    var g = new THREE.Group();
+    // a hanging banner in the army's color
+    var banMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.35, fog: false });
+    var banner = new THREE.Mesh(new THREE.PlaneGeometry(0.42, 0.62), banMat); g.add(banner);
+    var tri = new THREE.Mesh(new THREE.CircleGeometry(0.21, 3, -Math.PI / 2), banMat); tri.position.y = -0.31; g.add(tri);
+    // a brass trumpet in front of it, tilted up toward the player
+    var brass = new THREE.MeshStandardMaterial({ color: 0xd8a640, metalness: 0.7, roughness: 0.3, emissive: 0x000000 });
+    var tilt = new THREE.Group(); tilt.position.set(0, 0.02, 0.1); tilt.rotation.z = 0.45; g.add(tilt);
+    var horn = new THREE.Group(); horn.rotation.y = Math.PI / 2; tilt.add(horn);
+    var bell = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.2, 20, 1, true), brass);
+    bell.rotation.x = -Math.PI / 2; bell.position.z = 0.22; horn.add(bell);
+    var tube = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.42, 10), brass);
+    tube.rotation.x = Math.PI / 2; tube.position.z = -0.05; horn.add(tube);
+    var el = addEntity(levelRoot, g, -0.9 + i * 0.6, 1.78, Z + 0.05);
+    el.classList.add('clickable');
+    el.dataset.label = 'horn' + i;
+    var h = { el: el, mat: banMat, brass: brass };
+    el.addEventListener('mouseenter', function () { el.object3D.scale.set(1.12, 1.12, 1.12); });
+    el.addEventListener('mouseleave', function () { el.object3D.scale.set(1, 1, 1); });
+    el.addEventListener('click', function () { initAudio(); press(i); });
+    horns.push(h);
+  });
+  function light(i) {
+    var h = horns[i]; h.mat.opacity = 1; h.brass.emissive.setHex(0x664400);
+    h.el.object3D.scale.set(1.2, 1.2, 1.2);
+    blip(tones[i], 0.45, 'square', 0.09);
+    later(function () { h.mat.opacity = 0.35; h.brass.emissive.setHex(0x000000); h.el.object3D.scale.set(1, 1, 1); }, 420);
+  }
+  var seq = [], pos = 0, listening = false;
+  for (var k = 0; k < 5; k++) seq.push(Math.floor(Math.random() * 4));
+  if (window.GAME) window.GAME._seq = seq;
+  function play() {
+    listening = false; pos = 0;
+    seq.forEach(function (n, j) { later(function () { light(n); }, 600 + j * 700); });
+    later(function () { listening = true; showStatus('Your turn! Repeat the call.', 3000); }, 600 + seq.length * 700);
+  }
+  function press(i) {
+    if (!listening) return;
+    light(i);
+    if (i === seq[pos]) {
+      pos++;
+      if (pos === seq.length) { listening = false; later(win, 600); }
+    } else {
+      listening = false; SFX.bad(); addMistake();
+      showStatus('The signal was lost. Listen again...', 2500);
+      later(play, 1200);
+    }
+  }
+  var playBtn = makeButton(levelRoot, 'PLAY THE CALL', { w: 0.95, h: 0.3, x: 0, y: 1.06, z: Z, size: 26, onClick: function () { play(); } });
+  refreshRays();
+  later(play, 900);
+  function win() {
+    playBtn.remove(); horns.forEach(function (h) { removeEl(h.el); }); refreshRays();
+    SFX.fanfare();
+    panel.set({ title: 'SAVED!', body: '' });
+    var p2 = makePanel(levelRoot, { w: 2.2, h: 0.95, x: 0, y: 1.7, z: Z, bodySize: 25,
+      body: 'Just as you start to fall, a hand catches your arm and pulls you back from the edge.\nIt is GENERAL LASALLE. The French army has taken Toledo, and the Inquisition is in the hands of its enemies.\nYou are FREE.' });
+    continueButton(1.08, 'FINISH', ending);
+  }
+}
+
+/* ---------------- ENDING ---------------- */
+function ending() {
+  clearLevel(); showHud(false); setDarkness(false);
+  var secs = Math.round((performance.now() - STATE.start) / 1000);
+  var mm = Math.floor(secs / 60), ss = ('0' + (secs % 60)).slice(-2);
+  makePanel(levelRoot, { w: 2.4, h: 1.6, x: 0, y: 1.85, z: Z, title: 'YOU ESCAPED THE PIT', titleSize: 46, border: '#e8c27a',
+    body: 'Time: ' + mm + ':' + ss + '     Mistakes: ' + STATE.mistakes + '     Hints: ' + STATE.hints +
+      '\nEscape Code:  TOLEDO-1808\n\nBIG TAKEAWAY: Poe shows that the fear of what we cannot see can be worse than the danger itself, and that hope can come from the most unexpected places.\n\nREFLECT: Which moment of the story felt the most terrifying to you, and why?\n\nShow this screen to your teacher.', bodySize: 25 });
+  continueButton(0.88, 'PLAY AGAIN', intro);
+}
+
+/* ---------------- start up ---------------- */
+function globalTick(d, t) {
+  torches.forEach(function (tc) {
+    var f = 0.85 + 0.12 * Math.sin(t * 13 + tc.i * 2) + 0.06 * Math.sin(t * 31 + tc.i);
+    tc.light.intensity = 6 * f; tc.flame.scale.set(1, f, 1);
+  });
+  for (var i = 0; i < levelUpdaters.length; i++) levelUpdaters[i](d, t);
+  updateRats(d);
+}
+
+function init() {
+  levelRoot = $('#levelRoot'); hudRoot = $('#hudRoot');
+  buildRoom(); buildHud();
+  GAME_TICKS.push(globalTick);
+  intro();
+  // test hooks for teachers/debugging
+  window.GAME = { STATE: STATE, go: function (n) { [intro, level1, level2, level3, level4, level5, level6, ending][n](); } };
+}
+if (scene.hasLoaded) init(); else scene.addEventListener('loaded', init);
+})();
+</script>
+</body>
+</html>
