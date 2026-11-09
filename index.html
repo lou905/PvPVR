@@ -446,7 +446,7 @@ function buildHud() {
 }
 var statusTimer = null;
 function statusText() {
-  return 'Chamber ' + STATE.level + ' of 6   ·   Mistakes: ' + STATE.mistakes + '   ·   Hints: ' + STATE.hints;
+  return 'Chamber ' + STATE.level + ' of 7   ·   Mistakes: ' + STATE.mistakes + '   ·   Hints: ' + STATE.hints;
 }
 function showStatus(text, ms) {
   clearTimeout(statusTimer);
@@ -458,7 +458,7 @@ function showHud(on) {
   hudRoot.object3D.visible = on;
   if (on) hud.hint.enable(); else hud.hint.disable();
 }
-function addMistake() { STATE.mistakes++; updateStatus(); }
+function addMistake() { STATE.mistakes++; updateStatus(); buzz(0.6, 150); }
 function setLevelMeta(n, hint) { STATE.level = n; STATE.hint = hint; showHud(true); updateStatus(); }
 
 /* ---------------- level plumbing ---------------- */
@@ -468,6 +468,8 @@ function clearLevel() {
   levelUpdaters = [];
   removePendulum();
   resetWalls();
+  setLids(0);
+  if (MOVE.fade && MOVE.falling >= 0) resetRig();
   refreshRays();
 }
 function continueButton(y, label, next) {
@@ -477,7 +479,7 @@ function continueButton(y, label, next) {
 }
 
 // Generic multiple-choice runner (first answer in each list is correct)
-function runQuiz(title, intro, qs, onDone, onWrong) {
+function runQuiz(title, intro, qs, onDone, onWrong, onRight) {
   var i = 0, btns = [];
   var panel = makePanel(levelRoot, { w: 2.2, h: 1.05, x: 0, y: 2.27, z: Z, title: title, titleSize: 34, bodySize: 25 });
   function clearBtns() { btns.forEach(function (b) { b.remove(); }); btns = []; }
@@ -488,7 +490,7 @@ function runQuiz(title, intro, qs, onDone, onWrong) {
     shuffle(q.a.map(function (t, k) { return { t: t, k: k }; })).forEach(function (o, j) {
       var b = makeButton(levelRoot, o.t, { w: 2.0, h: 0.25, x: 0, y: 1.57 - j * 0.29, z: Z, size: 23, onClick: function () {
         if (o.k === 0) {
-          b.setState('good'); SFX.good(); btns.forEach(function (x) { x.disable(); });
+          b.setState('good'); SFX.good(); if (onRight) onRight(); btns.forEach(function (x) { x.disable(); });
           later(function () { i++; if (i < qs.length) show(); else { clearBtns(); onDone(panel); } }, 750);
         } else {
           b.setState('bad'); b.disable(); SFX.bad(); addMistake(); if (onWrong) onWrong();
@@ -506,7 +508,7 @@ function runQuiz(title, intro, qs, onDone, onWrong) {
 function intro() {
   clearLevel(); showHud(false); setDarkness(true);
   makePanel(levelRoot, { w: 2.3, h: 1.45, x: 0, y: 1.75, z: Z, title: 'ESCAPE THE PIT', titleSize: 52,
-    body: 'Toledo, Spain. The judges of the Inquisition have sentenced you to death.\nYou are the prisoner. Poe never gave him a name, so the prisoner is you.\n\nTo choose: point your controller and pull the TRIGGER.\n(On a computer: drag to look around, click to choose.)\n\nLook all around you. Clues hide in the dark.\nAnd watch your step... there is a pit.', bodySize: 25 });
+    body: 'Toledo, Spain. The judges of the Inquisition have sentenced you to death.\nYou are the prisoner. Poe never gave him a name, so the prisoner is you.\n\nTo choose: point your controller and pull the TRIGGER.\nTo walk: push the LEFT thumbstick. To turn: flick the RIGHT one.\n(On a computer: drag to look, click to choose, W A S D to walk.)\n\nLook all around you. Clues hide in the dark.\nAnd watch your step... there is a pit.', bodySize: 25 });
   continueButton(0.85, 'BEGIN', function () { STATE.start = performance.now(); STATE.mistakes = 0; STATE.hints = 0; level1(); });
 }
 
@@ -594,16 +596,78 @@ function level2() {
     { q: 'While feeling his way around the dark dungeon, what does he almost fall into?', a: ['A deep pit in the center of the floor', 'A rushing underground river', 'A trapdoor into the guards\' room'], hint: 'Look down. It\'s right in front of you.' },
     { q: 'Poe never gives the narrator a name. What effect does that have?', a: ['It lets the reader imagine being the prisoner', 'It shows the narrator is the villain', 'It means the story is not finished'], hint: 'Without a name, who could the prisoner be?' }
   ], function (panel) {
-    panel.set({ title: 'THE TRIBUNAL FALLS SILENT', body: 'The judges turn away. A guard hands you a jug of water... it tastes strange.\nYour eyes grow heavy. You sink into a drugged sleep.' });
-    continueButton(1.45, 'CONTINUE', level3);
+    panel.set({ title: 'THE TRIBUNAL FALLS SILENT', body: 'The judges turn away. The torches die, and the darkness swallows you again.\nYour throat burns with thirst...' });
+    continueButton(1.45, 'CONTINUE', levelDrug);
   });
 }
 
-/* ---------------- CHAMBER III: THE PAINTED WALLS ---------------- */
+/* ---------------- CHAMBER III: THE DRUGGED WATER ---------------- */
+var lids = null, lidAmt = 0;
+function buildLids() {
+  if (lids) return;
+  var cam = $('#cam').object3D, mat = new THREE.MeshBasicMaterial({ color: 0x000000, depthTest: false, depthWrite: false, transparent: true, opacity: 0.97 });
+  var geo = new THREE.PlaneGeometry(3, 1.2);
+  lids = [new THREE.Mesh(geo, mat), new THREE.Mesh(geo, mat)];
+  lids.forEach(function (m) { m.renderOrder = 999; m.position.z = -0.3; cam.add(m); });
+  var rimM = new THREE.MeshBasicMaterial({ color: 0x3a0a0a, depthTest: false, depthWrite: false, transparent: true, opacity: 0.9 });
+  [1, -1].forEach(function (sd, i) { var r = new THREE.Mesh(new THREE.PlaneGeometry(3, 0.035), rimM); r.renderOrder = 1000; r.position.y = -sd * 0.6; lids[i].add(r); });
+  var veil = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.MeshBasicMaterial({ color: 0x000000, depthTest: false, depthWrite: false, transparent: true, opacity: 0 }));
+  veil.renderOrder = 998; veil.position.z = -0.31; cam.add(veil); lids.veil = veil;
+  setLids(0);
+}
+function setLids(a) {
+  lidAmt = Math.max(0, Math.min(1, a)); if (!lids) return;
+  var open = 0.6 + 0.38 * (1 - lidAmt);   // half-height of the gap between the lids at 0.3 m
+  lids[0].position.y = open; lids[1].position.y = -open;
+  lids.forEach(function (m) { m.visible = lidAmt > 0.01; });
+  lids.veil.material.opacity = 0.45 * lidAmt; lids.veil.visible = lidAmt > 0.01;
+}
+function levelDrug() {
+  clearLevel(); setDarkness(true); buildLids(); setLids(0);
+  setLevelMeta(3, 'Answer fast. Every right answer pushes your eyelids back open. Wrong answers make you sleepier.');
+  var drowse = 0, fighting = false, right = 0, need = 5;
+  var panel = makePanel(levelRoot, { w: 2.2, h: 0.95, x: 0, y: 2.2, z: Z, title: 'CHAMBER III · THE DRUGGED WATER', titleSize: 32,
+    body: '"A deep sleep fell upon me, a sleep like that of death."\nYour throat burns with thirst. A pitcher and a cup sit beside the bread. You should not trust anything the Inquisition gives you... but you must drink.', bodySize: 24 });
+  var cupEl = document.createElement('a-entity');
+  cupEl.setAttribute('geometry', 'primitive: cylinder; radius: 0.09; height: 0.2; openEnded: false');
+  cupEl.setAttribute('material', 'color: #6e655c; roughness: 0.8; emissive: #3a2a10; emissiveIntensity: 0.6');
+  cupEl.setAttribute('position', '0 0.95 ' + (Z + 0.9)); cupEl.classList.add('clickable'); levelRoot.appendChild(cupEl);
+  var drinkBtn = makeButton(levelRoot, 'DRINK FROM THE CUP', { w: 1.3, h: 0.32, x: 0, y: 1.45, z: Z, size: 28, onClick: drink });
+  cupEl.addEventListener('click', drink);
+  function drink() {
+    if (fighting) return; fighting = true; initAudio();
+    [0, 0.18, 0.36].forEach(function (t) { blip(1300 + Math.random() * 500, 0.1, 'sine', 0.12, t); });
+    drinkBtn.remove(); removeEl(cupEl); removeEl(panel.el); refreshRays(); drowse = 0.15;
+    showStatus('The room swims... answer the clues before your eyes close!', 5000);
+    runQuiz('CHAMBER III · FIGHT THE SLEEP', 'Your eyelids are heavy. Answer ' + need + ' clues to hold on.', shuffle([
+      { q: 'You drink, and almost at once a heavy, unnatural sleep pulls at you. What can you infer about the water?', a: ['It was drugged by your captors', 'It was poisoned to kill you instantly', 'It was perfectly ordinary water'], hint: 'What happened the moment you drank it?' },
+      { q: 'Why would the Inquisition want their prisoner asleep?', a: ['So they can move him and set up the next torture without a fight', 'So he will forget why he was arrested', 'So he can rest before being set free'], hint: 'When the narrator wakes up, he is strapped to a wooden frame.' },
+      { q: 'Poe writes "a sleep like that of death." What kind of figurative language is that?', a: ['A simile: it compares using "like"', 'A metaphor: it says sleep IS death', 'Onomatopoeia: it imitates a sound'], hint: 'Look for the word "like."' },
+      { q: 'What does it mean to make an inference?', a: ['Use clues plus what you know to figure out something not stated', 'Copy a sentence word for word', 'Guess with no evidence at all'], hint: 'Poe never says right away that the water was drugged. Readers figure it out.' },
+      { q: 'Food, water, and later light are all "gifts" from the captors. Why are they frightening?', a: ['Each one keeps him alive for the next, worse torture', 'They are signs he will soon be released', 'They prove the guards feel sorry for him'], hint: 'Every mercy in this story sets up the next horror.' },
+      { q: 'Losing control of even his own sleep shows which theme?', a: ['Helplessness and psychological terror', 'Love conquers all', 'Greed leads to ruin'], hint: 'The Inquisition controls everything, even his sleep.' }
+    ]).slice(0, need), function (p) {
+      fighting = false;
+      p.set({ title: 'A SLEEP LIKE DEATH', body: 'You held on long enough to understand: the water was drugged, and the Inquisition is not finished with you.\nThen the drug wins. Your eyes close...\nWhen you wake, a strange glow is seeping from the walls.' });
+      var closing = 0;
+      levelUpdaters.push(function (d) { closing += d; setLids(Math.min(1, drowse + closing * 0.5)); });
+      continueButton(1.45, 'OPEN YOUR EYES', function () { setLids(0); level3(); });
+    }, function () { drowse = Math.min(0.97, drowse + 0.12); }, function () { drowse = Math.max(0, drowse - 0.3); });
+  }
+  levelUpdaters.push(function (d) {
+    if (!fighting) return;
+    drowse += d * 0.02;
+    if (drowse >= 1) { addMistake(); SFX.rumble(); drowse = 0.55; showStatus('Your eyes slam shut... you jerk awake! Fight it!', 3500); }
+    setLids(drowse);
+  });
+  refreshRays();
+}
+
+/* ---------------- CHAMBER IV: THE PAINTED WALLS ---------------- */
 function level3() {
   clearLevel(); setDarkness(false); setEyes(0.35);
-  setLevelMeta(3, 'The Pit = death and fear of the unknown. Then ask: what does each object DO to the prisoner?');
-  var panel = makePanel(levelRoot, { w: 2.7, h: 0.48, x: 0, y: 2.6, z: Z, title: 'CHAMBER III · THE PAINTED WALLS', titleSize: 30, pad: 18,
+  setLevelMeta(4, 'The Pit = death and fear of the unknown. Then ask: what does each object DO to the prisoner?');
+  var panel = makePanel(levelRoot, { w: 2.7, h: 0.48, x: 0, y: 2.6, z: Z, title: 'CHAMBER IV · THE PAINTED WALLS', titleSize: 30, pad: 18,
     body: 'Fiends\' eyes watch from the walls. Pick a SYMBOL on the left, then its MEANING on the right.', bodySize: 22 });
   var pairs = [['The Pit', 'Death and fear of the unknown'], ['The Pendulum', 'Time running out'], ['The Closing Walls', 'Being trapped and helpless'], ['The Rats', 'Hope from an unexpected place'], ['The Darkness', 'Fear and uncertainty']];
   var ys = [2.17, 1.89, 1.61, 1.33, 1.05], sel = null, matched = 0;
@@ -639,7 +703,7 @@ function level3() {
 /* ---------------- CHAMBER IV: THE PENDULUM ---------------- */
 function level4() {
   clearLevel(); setDarkness(false); buildPendulum();
-  setLevelMeta(4, 'Every wrong answer drops the blade faster. Think about what the prisoner had on his plate.');
+  setLevelMeta(5, 'Every wrong answer drops the blade faster. Think about what the prisoner had on his plate.');
   var L = 2.2, Lmax = 3.75, active = true, freed = false, lastSign = 0;
   levelUpdaters.push(function (d, t) {
     if (!pend) return;
@@ -653,7 +717,7 @@ function level4() {
     if (!freed) setEyes(0.1 + 0.8 * (L - 2.2) / (Lmax - 2.2));
     if (active && L >= Lmax) { active = false; fail(); }
   });
-  runQuiz('CHAMBER IV · THE PENDULUM', 'You are strapped down. LOOK UP: a razor-sharp blade swings, lower with every pass. Answer fast!', [
+  runQuiz('CHAMBER V · THE PENDULUM', 'You are strapped down. LOOK UP: a razor-sharp blade swings, lower with every pass. Answer fast!', [
     { q: 'The pendulum drops slowly, swing after swing. What does it symbolize?', a: ['Time running out and death coming closer', 'The narrator\'s love for his family', 'The power of the French army'], hint: 'A pendulum is what makes a clock tick.' },
     { q: 'You have a plate of food beside you. How does the narrator use it to escape?', a: ['He rubs the greasy meat on his straps', 'He throws it at the guards', 'He eats it to get strong enough to break free'], hint: 'Remember the word from Chamber I. What would rats want?' }
   ], function (panel) {
@@ -683,7 +747,7 @@ function level4() {
 /* ---------------- CHAMBER V: THE BURNING WALLS ---------------- */
 function level5() {
   clearLevel(); setDarkness(false); SFX.rumble();
-  setLevelMeta(5, 'Retrace the story: sentenced, darkness, pit, pendulum, rats... what came last?');
+  setLevelMeta(6, 'Retrace the story: sentenced, darkness, pit, pendulum, rats... what came last?');
   var wallX = 5, minX = 1.5, running = true;
   levelUpdaters.push(function (d, t) {
     if (running) wallX = Math.max(minX, wallX - d * ((5 - minX) / 140));
@@ -693,7 +757,7 @@ function level5() {
     setEyes(Math.min(1, 0.3 + heat));
     if (running && wallX <= minX) { running = false; fail(); }
   });
-  var panel = makePanel(levelRoot, { w: 2.4, h: 0.62, x: 0, y: 2.48, z: Z, title: 'CHAMBER V · THE BURNING WALLS', titleSize: 30, pad: 18,
+  var panel = makePanel(levelRoot, { w: 2.4, h: 0.62, x: 0, y: 2.48, z: Z, title: 'CHAMBER VI · THE BURNING WALLS', titleSize: 30, pad: 18,
     body: 'The walls glow red-hot and creep toward you! Click the story\'s events IN ORDER, first to last, to stop them.', bodySize: 23 });
   var events = ['The judges sentence him to death', 'He wakes in total darkness', 'He nearly falls into the pit', 'He is strapped beneath the pendulum', 'Rats chew through his straps', 'The burning walls close in'];
   var next = 0, cells = [];
@@ -728,8 +792,8 @@ function level5() {
 /* ---------------- CHAMBER VI: THE TRUMPETS ---------------- */
 function level6() {
   clearLevel(); setDarkness(false); setWallHeat(0.12); walls.left.position.x = -3; walls.right.position.x = 3;
-  setLevelMeta(6, 'Watch which trumpet lights up first, second, and so on. Press PLAY THE CALL to hear it again.');
-  var panel = makePanel(levelRoot, { w: 2.2, h: 0.72, x: 0, y: 2.55, z: Z, title: 'CHAMBER VI · THE TRUMPETS', titleSize: 32, pad: 18,
+  setLevelMeta(7, 'Watch which trumpet lights up first, second, and so on. Press PLAY THE CALL to hear it again.');
+  var panel = makePanel(levelRoot, { w: 2.2, h: 0.72, x: 0, y: 2.55, z: Z, title: 'CHAMBER VII · THE TRUMPETS', titleSize: 32, pad: 18,
     body: 'An army is outside! Watch and listen to the trumpet call, then repeat it by pointing at the trumpets in the same order.', bodySize: 23 });
   var colors = [0xd4a017, 0xb3202a, 0x2a4fb3, 0x2a8f3c], tones = [392, 523, 659, 784];
   var horns = [];
@@ -806,6 +870,72 @@ function ending() {
   continueButton(0.88, 'PLAY AGAIN', intro);
 }
 
+/* ---------------- WALKING, TURNING & THE PIT ---------------- */
+var MOVE = { lx: 0, ly: 0, keys: {}, turnReady: true, falling: 0, falls: 0, fade: null };
+var PIT = { x: 0, z: -2.5, r: 1.12 };
+function buzz(v, ms) {
+  ['#rh', '#lh'].forEach(function (s) {
+    var el = $(s), tc = el && el.components && el.components['tracked-controls'];
+    var gp = tc && tc.controller && tc.controller.gamepad;
+    try { if (gp && gp.hapticActuators && gp.hapticActuators[0]) gp.hapticActuators[0].pulse(v, ms); } catch (e) {}
+  });
+}
+function rigObj() { return $('#rig').object3D; }
+function camWorld() { var v = new THREE.Vector3(); $('#cam').object3D.getWorldPosition(v); return v; }
+function resetRig() { var r = rigObj(); r.position.set(0, 0, 0); r.rotation.set(0, 0, 0); MOVE.falling = 0; if (MOVE.fade) MOVE.fade.material.opacity = 0; }
+function snapTurn(dir) {
+  var r = rigObj(), before = camWorld();
+  r.rotation.y += dir * Math.PI / 6; r.updateMatrixWorld(true);
+  var after = camWorld(); r.position.x += before.x - after.x; r.position.z += before.z - after.z;
+}
+function setupMovement() {
+  var cam = $('#cam').object3D;
+  MOVE.fade = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.MeshBasicMaterial({ color: 0x000000, depthTest: false, depthWrite: false, transparent: true, opacity: 0 }));
+  MOVE.fade.renderOrder = 1001; MOVE.fade.position.z = -0.28; cam.add(MOVE.fade);
+  var lh = $('#lh'), rh = $('#rh');
+  if (lh) lh.addEventListener('thumbstickmoved', function (e) { MOVE.lx = e.detail.x; MOVE.ly = e.detail.y; });
+  if (rh) rh.addEventListener('thumbstickmoved', function (e) {
+    var x = e.detail.x;
+    if (Math.abs(x) < 0.3) MOVE.turnReady = true;
+    else if (MOVE.turnReady && Math.abs(x) > 0.7) { MOVE.turnReady = false; snapTurn(x > 0 ? -1 : 1); }
+  });
+  window.addEventListener('keydown', function (e) { MOVE.keys[e.code] = true; if (e.code === 'KeyQ') snapTurn(1); if (e.code === 'KeyE') snapTurn(-1); });
+  window.addEventListener('keyup', function (e) { MOVE.keys[e.code] = false; });
+  GAME_TICKS.push(moveTick);
+}
+function moveTick(d) {
+  var r = rigObj();
+  if (MOVE.falling > 0) {
+    MOVE.falling += d;
+    r.position.y -= d * (2 + MOVE.falling * 9);
+    MOVE.fade.material.opacity = Math.min(1, MOVE.falling / 0.8);
+    if (MOVE.falling > 1.1) {
+      resetRig(); MOVE.fade.material.opacity = 1; MOVE.falling = -1;
+      setTimeout(function () { var t = 0, iv = setInterval(function () { t += 0.05; MOVE.fade.material.opacity = Math.max(0, 1 - t); if (t >= 1) { clearInterval(iv); MOVE.falling = 0; } }, 30); }, 250);
+    }
+    return;
+  }
+  if (MOVE.falling < 0) return;
+  var mx = MOVE.lx, mz = MOVE.ly, k = MOVE.keys;
+  if (k.KeyW || k.ArrowUp) mz = -1; if (k.KeyS || k.ArrowDown) mz = 1; if (k.KeyA || k.ArrowLeft) mx = -1; if (k.KeyD || k.ArrowRight) mx = 1;
+  if (Math.abs(mx) < 0.15) mx = 0; if (Math.abs(mz) < 0.15) mz = 0;
+  if (mx || mz) {
+    var q = new THREE.Quaternion(); $('#cam').object3D.getWorldQuaternion(q);
+    var fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q); fwd.y = 0; fwd.normalize();
+    var right = new THREE.Vector3(1, 0, 0).applyQuaternion(q); right.y = 0; right.normalize();
+    var sp = 1.6 * d;
+    r.position.addScaledVector(fwd, -mz * sp); r.position.addScaledVector(right, mx * sp);
+    var c = camWorld();
+    if (c.x < -4.6) r.position.x += -4.6 - c.x; if (c.x > 4.6) r.position.x -= c.x - 4.6;
+    if (c.z < -6.6) r.position.z += -6.6 - c.z; if (c.z > 2.6) r.position.z -= c.z - 2.6;
+  }
+  var cw = camWorld();
+  if (Math.hypot(cw.x - PIT.x, cw.z - PIT.z) < PIT.r) {
+    MOVE.falling = 0.001; MOVE.falls++; addMistake(); buzz(1, 600); SFX.rumble();
+    showStatus('You fell into the pit! Back to where you woke up. (Mistake +1)', 4500);
+  }
+}
+
 /* ---------------- start up ---------------- */
 function globalTick(d, t) {
   torches.forEach(function (tc) {
@@ -818,11 +948,11 @@ function globalTick(d, t) {
 
 function init() {
   levelRoot = $('#levelRoot'); hudRoot = $('#hudRoot');
-  buildRoom(); buildHud();
+  buildRoom(); buildHud(); setupMovement();
   GAME_TICKS.push(globalTick);
   intro();
   // test hooks for teachers/debugging
-  window.GAME = { STATE: STATE, go: function (n) { [intro, level1, level2, level3, level4, level5, level6, ending][n](); } };
+  window.GAME = { STATE: STATE, go: function (n) { [intro, level1, level2, levelDrug, level3, level4, level5, level6, ending][n](); } };
 }
 if (scene.hasLoaded) init(); else scene.addEventListener('loaded', init);
 })();
